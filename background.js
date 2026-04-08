@@ -1583,6 +1583,28 @@ async function resolveVerificationStep(step, state, mail) {
 async function executeStep4(state) {
   const mail = getMailConfig(state);
   if (mail.error) throw new Error(mail.error);
+  const signupTabId = await getTabId('signup-page');
+  if (!signupTabId) {
+    throw new Error('认证页面标签页已关闭，无法继续步骤 4。');
+  }
+
+  await chrome.tabs.update(signupTabId, { active: true });
+  await addLog('步骤 4：正在确认注册验证码页面是否就绪，必要时自动恢复密码页超时报错...');
+  const prepareResult = await sendToContentScript('signup-page', {
+    type: 'PREPARE_SIGNUP_VERIFICATION',
+    step: 4,
+    source: 'background',
+    payload: { password: state.password || state.customPassword || '' },
+  });
+
+  if (prepareResult && prepareResult.error) {
+    throw new Error(prepareResult.error);
+  }
+  if (prepareResult?.alreadyVerified) {
+    await completeStepFromBackground(4, {});
+    return;
+  }
+
   await addLog(`步骤 4：正在打开${mail.label}...`);
 
   // For mail tabs, only create if not alive — don't navigate (preserves login session)
