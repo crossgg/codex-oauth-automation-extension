@@ -223,6 +223,12 @@ function isSignupPageHost(hostname = '') {
   return ['auth0.openai.com', 'auth.openai.com', 'accounts.openai.com'].includes(hostname);
 }
 
+function is163MailHost(hostname = '') {
+  return hostname === 'mail.163.com'
+    || hostname.endsWith('.mail.163.com')
+    || hostname === 'webmail.vip.163.com';
+}
+
 function buildLocalhostCleanupPrefix(rawUrl) {
   const parsed = parseUrlSafely(rawUrl);
   if (!parsed || parsed.hostname !== 'localhost') return '';
@@ -249,7 +255,7 @@ function matchesSourceUrlFamily(source, candidateUrl, referenceUrl) {
     case 'qq-mail':
       return candidate.hostname === 'mail.qq.com' || candidate.hostname === 'wx.mail.qq.com';
     case 'mail-163':
-      return candidate.hostname === 'mail.163.com' || candidate.hostname.endsWith('.mail.163.com');
+      return is163MailHost(candidate.hostname);
     case 'inbucket-mail':
       return Boolean(reference)
         && candidate.origin === reference.origin
@@ -1763,6 +1769,9 @@ function getMailConfig(state) {
   const provider = state.mailProvider || 'qq';
   if (provider === '163') {
     return { source: 'mail-163', url: 'https://mail.163.com/js6/main.jsp?df=mail163_letter#module=mbox.ListModule%7C%7B%22fid%22%3A1%2C%22order%22%3A%22date%22%2C%22desc%22%3Atrue%7D', label: '163 邮箱' };
+  }
+  if (provider === '163-vip') {
+    return { source: 'mail-163', url: 'https://webmail.vip.163.com/js6/main.jsp?df=mail163_letter#module=mbox.ListModule%7C%7B%22fid%22%3A1%2C%22order%22%3A%22date%22%2C%22desc%22%3Atrue%7D', label: '163 VIP 邮箱' };
   }
   if (provider === 'inbucket') {
     const host = normalizeInbucketOrigin(state.inbucketHost);
