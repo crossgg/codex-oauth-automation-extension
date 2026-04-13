@@ -671,8 +671,7 @@ function updateFallbackThreadIntervalInputState() {
     return;
   }
 
-  const enabled = inputAutoSkipFailures.checked && getRunCountValue() > 1;
-  inputAutoSkipFailuresThreadIntervalMinutes.disabled = !enabled;
+  inputAutoSkipFailuresThreadIntervalMinutes.disabled = true;
 }
 
 function updateAutoDelayInputState() {
@@ -846,7 +845,7 @@ function collectSettingsPayload() {
     hotmailLocalBaseUrl: inputHotmailLocalBaseUrl.value.trim(),
     cloudflareDomain: selectedCloudflareDomain,
     cloudflareDomains: domains,
-    autoRunSkipFailures: inputAutoSkipFailures.checked,
+    autoRunSkipFailures: true,
     autoRunFallbackThreadIntervalMinutes: normalizeAutoRunThreadIntervalMinutes(inputAutoSkipFailuresThreadIntervalMinutes.value),
     autoRunDelayEnabled: inputAutoDelayEnabled.checked,
     autoRunDelayMinutes: normalizeAutoDelayMinutes(inputAutoDelayMinutes.value),
@@ -1018,7 +1017,7 @@ function applyAutoRunStatus(payload = currentAutoRun) {
     || usesGeneratedAliasMailProvider(selectMailProvider.value)
     || isCustomEmailGeneratorSelected();
   inputEmail.disabled = locked;
-  inputAutoSkipFailures.disabled = scheduled;
+  inputAutoSkipFailures.disabled = true;
 
   if (currentAutoRun.totalRuns > 0) {
     inputRunCount.value = String(currentAutoRun.totalRuns);
@@ -1122,7 +1121,7 @@ function applySettingsState(state) {
   inputHotmailLocalBaseUrl.value = state?.hotmailLocalBaseUrl || '';
   renderCloudflareDomainOptions(state?.cloudflareDomain || '');
   setCloudflareDomainEditMode(false, { clearInput: true });
-  inputAutoSkipFailures.checked = Boolean(state?.autoRunSkipFailures);
+  inputAutoSkipFailures.checked = true;
   inputAutoSkipFailuresThreadIntervalMinutes.value = String(normalizeAutoRunThreadIntervalMinutes(state?.autoRunFallbackThreadIntervalMinutes));
   inputAutoDelayEnabled.checked = Boolean(state?.autoRunDelayEnabled);
   inputAutoDelayMinutes.value = String(normalizeAutoDelayMinutes(state?.autoRunDelayMinutes));
@@ -2674,25 +2673,6 @@ btnAutoRun.addEventListener('click', async () => {
       mode = choice;
     }
 
-    const autoRunSkipFailures = inputAutoSkipFailures.checked;
-    const fallbackThreadIntervalMinutes = normalizeAutoRunThreadIntervalMinutes(
-      inputAutoSkipFailuresThreadIntervalMinutes.value
-    );
-    inputAutoSkipFailuresThreadIntervalMinutes.value = String(fallbackThreadIntervalMinutes);
-
-    if (
-      shouldWarnAutoRunFallbackRisk(totalRuns, autoRunSkipFailures)
-      && !isAutoRunFallbackRiskPromptDismissed()
-    ) {
-      const result = await openAutoRunFallbackRiskConfirmModal(totalRuns, fallbackThreadIntervalMinutes);
-      if (!result.confirmed) {
-        return;
-      }
-      if (result.dismissPrompt) {
-        setAutoRunFallbackRiskPromptDismissed(true);
-      }
-    }
-
     btnAutoRun.disabled = true;
     inputRunCount.disabled = true;
     const delayEnabled = inputAutoDelayEnabled.checked;
@@ -2707,7 +2687,7 @@ btnAutoRun.addEventListener('click', async () => {
       payload: {
         totalRuns,
         delayMinutes,
-        autoRunSkipFailures,
+        autoRunSkipFailures: true,
         mode,
       },
     });
@@ -2990,21 +2970,8 @@ inputRunCount.addEventListener('blur', () => {
 });
 
 inputAutoSkipFailures.addEventListener('change', async () => {
-  if (inputAutoSkipFailures.checked && !isAutoSkipFailuresPromptDismissed()) {
-    const result = await openAutoSkipFailuresConfirmModal();
-    if (!result.confirmed) {
-      inputAutoSkipFailures.checked = false;
-      updateFallbackThreadIntervalInputState();
-      return;
-    }
-    if (result.dismissPrompt) {
-      setAutoSkipFailuresPromptDismissed(true);
-    }
-  }
-
+  inputAutoSkipFailures.checked = true;
   updateFallbackThreadIntervalInputState();
-  markSettingsDirty(true);
-  saveSettings({ silent: true }).catch(() => { });
 });
 
 inputAutoSkipFailuresThreadIntervalMinutes.addEventListener('input', () => {
@@ -3137,7 +3104,7 @@ chrome.runtime.onMessage.addListener((message) => {
         }
       }
       if (message.payload.autoRunSkipFailures !== undefined) {
-        inputAutoSkipFailures.checked = Boolean(message.payload.autoRunSkipFailures);
+        inputAutoSkipFailures.checked = true;
         updateFallbackThreadIntervalInputState();
       }
       if (message.payload.autoRunDelayEnabled !== undefined) {

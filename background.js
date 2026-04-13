@@ -37,6 +37,8 @@ const DEFAULT_SUB2API_REDIRECT_URI = 'http://localhost:1455/auth/callback';
 const AUTO_RUN_ALARM_NAME = 'scheduled-auto-run';
 const AUTO_RUN_DELAY_MIN_MINUTES = 1;
 const AUTO_RUN_DELAY_MAX_MINUTES = 1440;
+const AUTO_RUN_RETRY_DELAY_MS = 3000;
+const AUTO_RUN_MAX_RETRIES_PER_ROUND = 3;
 const AUTO_STEP_DELAY_MIN_ALLOWED_SECONDS = 0;
 const AUTO_STEP_DELAY_MAX_ALLOWED_SECONDS = 600;
 const LEGACY_AUTO_STEP_DELAY_KEYS = ['autoStepRandomDelayMinSeconds', 'autoStepRandomDelayMaxSeconds'];
@@ -63,7 +65,7 @@ const PERSISTED_SETTING_DEFAULTS = {
   sub2apiPassword: '',
   sub2apiGroupName: DEFAULT_SUB2API_GROUP_NAME,
   customPassword: '',
-  autoRunSkipFailures: false,
+  autoRunSkipFailures: true,
   autoRunFallbackThreadIntervalMinutes: 0,
   autoRunDelayEnabled: false,
   autoRunDelayMinutes: 30,
@@ -113,6 +115,7 @@ const DEFAULT_STATE = {
   autoRunCurrentRun: 0, // 自动运行当前执行到第几轮。
   autoRunTotalRuns: 1, // 自动运行计划总轮数。
   autoRunAttemptRun: 0, // 当前轮次的重试序号。
+  autoRunRoundSummaries: [], // 自动运行轮次摘要。
   scheduledAutoRunAt: null, // 自动运行计划启动时间戳。
   scheduledAutoRunPlan: null, // 自动运行计划参数快照。
   signupVerificationRequestedAt: null,
@@ -201,7 +204,7 @@ function normalizeScheduledAutoRunPlan(plan) {
 
   return {
     totalRuns: normalizeRunCount(plan.totalRuns),
-    autoRunSkipFailures: Boolean(plan.autoRunSkipFailures),
+    autoRunSkipFailures: true,
     mode: plan.mode === 'continue' ? 'continue' : 'restart',
   };
 }
@@ -2516,8 +2519,8 @@ async function launchScheduledAutoRun(trigger = 'alarm') {
         : '倒计时结束，自动运行开始执行。',
       'info'
     );
-    autoRunLoop(plan.totalRuns, {
-      autoRunSkipFailures: plan.autoRunSkipFailures,
+    startAutoRunLoop(plan.totalRuns, {
+      autoRunSkipFailures: true,
       mode: plan.mode,
     });
     return true;
@@ -2833,10 +2836,10 @@ async function handleMessage(message, sender) {
         throw new Error('已有自动运行倒计时计划，请先取消或立即开始。');
       }
       const totalRuns = normalizeRunCount(message.payload?.totalRuns || 1);
-      const autoRunSkipFailures = Boolean(message.payload?.autoRunSkipFailures);
+      const autoRunSkipFailures = true;
       const mode = message.payload?.mode === 'continue' ? 'continue' : 'restart';
       await setState({ autoRunSkipFailures });
-      autoRunLoop(totalRuns, { autoRunSkipFailures, mode });  // fire-and-forget
+      startAutoRunLoop(totalRuns, { autoRunSkipFailures, mode });
       return { ok: true };
     }
 
@@ -2845,7 +2848,7 @@ async function handleMessage(message, sender) {
       const totalRuns = normalizeRunCount(message.payload?.totalRuns || 1);
       return await scheduleAutoRun(totalRuns, {
         delayMinutes: message.payload?.delayMinutes,
-        autoRunSkipFailures: Boolean(message.payload?.autoRunSkipFailures),
+        autoRunSkipFailures: true,
         mode: message.payload?.mode,
       });
     }
@@ -2872,7 +2875,11 @@ async function handleMessage(message, sender) {
       if (message.payload.email) {
         await setEmailState(message.payload.email);
       }
-      resumeAutoRun();  // fire-and-forget
+      resumeAutoRun().catch((error) => {
+        handleAutoRunLoopUnhandledError(error).catch((handlerError) => {
+          console.error(LOG_PREFIX, 'Failed to finalize resume error:', handlerError);
+        });
+      });
       return { ok: true };
     }
 
@@ -3645,7 +3652,7 @@ async function runAutoSequenceFromStep(startStep, context = {}) {
 }
 
 // Outer loop: keep retrying until the target number of successful runs is reached.
-async function autoRunLoop(totalRuns, options = {}) {
+async function legacyAutoRunLoop(totalRuns, options = {}) {
   if (autoRunActive) {
     await addLog('自动运行已在进行中', 'warn');
     return;
@@ -3877,7 +3884,7 @@ async function waitForResume() {
   });
 }
 
-async function resumeAutoRun() {
+async function legacyResumeAutoRun() {
   throwIfStopped();
   const state = await getState();
   if (!state.email) {
@@ -3910,6 +3917,427 @@ async function resumeAutoRun() {
     resumeCurrentRun: currentRun,
     resumeSuccessfulRuns: successfulRuns,
     resumeAttemptRunsProcessed: Math.max(0, attemptRun - 1),
+  });
+  return true;
+}
+
+function createAutoRunRoundSummary(round) {
+  return {
+    round,
+    status: 'pending',
+    attempts: 0,
+    failureReasons: [],
+    finalFailureReason: '',
+  };
+}
+
+function normalizeAutoRunRoundSummary(summary, round) {
+  const base = createAutoRunRoundSummary(round);
+  if (!summary || typeof summary !== 'object') {
+    return base;
+  }
+
+  const status = String(summary.status || '').trim().toLowerCase();
+  return {
+    round,
+    status: ['pending', 'success', 'failed'].includes(status) ? status : base.status,
+    attempts: Math.max(0, Math.floor(Number(summary.attempts) || 0)),
+    failureReasons: Array.isArray(summary.failureReasons)
+      ? summary.failureReasons.map((item) => String(item || '').trim()).filter(Boolean)
+      : [],
+    finalFailureReason: String(summary.finalFailureReason || '').trim(),
+  };
+}
+
+function buildAutoRunRoundSummaries(totalRuns, rawSummaries = []) {
+  return Array.from({ length: totalRuns }, (_, index) => {
+    return normalizeAutoRunRoundSummary(rawSummaries[index], index + 1);
+  });
+}
+
+function serializeAutoRunRoundSummaries(totalRuns, roundSummaries = []) {
+  return buildAutoRunRoundSummaries(totalRuns, roundSummaries).map((summary) => ({
+    ...summary,
+    failureReasons: [...summary.failureReasons],
+  }));
+}
+
+function getAutoRunRoundRetryCount(summary) {
+  return Math.max(0, Number(summary?.attempts || 0) - 1);
+}
+
+function formatAutoRunFailureReasons(reasons = []) {
+  if (!Array.isArray(reasons) || !reasons.length) {
+    return '未知错误';
+  }
+
+  const counts = new Map();
+  for (const reason of reasons) {
+    const normalized = String(reason || '').trim() || '未知错误';
+    counts.set(normalized, (counts.get(normalized) || 0) + 1);
+  }
+
+  return Array.from(counts.entries())
+    .map(([reason, count]) => (count > 1 ? `${reason}（${count}次）` : reason))
+    .join('；');
+}
+
+async function logAutoRunFinalSummary(totalRuns, roundSummaries = []) {
+  const summaries = buildAutoRunRoundSummaries(totalRuns, roundSummaries);
+  const successRounds = summaries.filter((item) => item.status === 'success');
+  const failedRounds = summaries.filter((item) => item.status === 'failed');
+  const pendingRounds = summaries.filter((item) => item.status === 'pending');
+
+  await addLog('=== 自动运行汇总 ===', failedRounds.length ? 'warn' : 'ok');
+  await addLog(
+    `总轮数：${totalRuns}；成功：${successRounds.length}；失败：${failedRounds.length}；未完成：${pendingRounds.length}`,
+    failedRounds.length ? 'warn' : 'ok'
+  );
+
+  if (successRounds.length) {
+    await addLog(
+      `成功轮次：${successRounds
+        .map((item) => `第 ${item.round} 轮（重试 ${getAutoRunRoundRetryCount(item)} 次）`)
+        .join('；')}`,
+      'ok'
+    );
+  }
+
+  if (failedRounds.length) {
+    await addLog(
+      `失败轮次：${failedRounds
+        .map((item) => {
+          const retryCount = getAutoRunRoundRetryCount(item);
+          const finalReason = item.finalFailureReason || item.failureReasons[item.failureReasons.length - 1] || '未知错误';
+          const reasonSummary = formatAutoRunFailureReasons(item.failureReasons);
+          return `第 ${item.round} 轮（重试 ${retryCount} 次，最终原因：${finalReason}；失败记录：${reasonSummary}）`;
+        })
+        .join('；')}`,
+      'error'
+    );
+  }
+
+  if (pendingRounds.length) {
+    await addLog(
+      `未完成轮次：${pendingRounds.map((item) => `第 ${item.round} 轮`).join('；')}`,
+      'warn'
+    );
+  }
+}
+
+async function handleAutoRunLoopUnhandledError(error) {
+  console.error(LOG_PREFIX, 'Auto run loop crashed:', error);
+  if (!isStopError(error)) {
+    await addLog(`自动运行异常终止：${getErrorMessage(error) || '未知错误'}`, 'error');
+  }
+
+  autoRunActive = false;
+  await broadcastAutoRunStatus('stopped', {
+    currentRun: autoRunCurrentRun,
+    totalRuns: autoRunTotalRuns,
+    attemptRun: autoRunAttemptRun,
+  });
+  clearStopRequest();
+}
+
+function startAutoRunLoop(totalRuns, options = {}) {
+  autoRunLoop(totalRuns, options).catch((error) => {
+    handleAutoRunLoopUnhandledError(error).catch((handlerError) => {
+      console.error(LOG_PREFIX, 'Failed to finalize auto run error:', handlerError);
+    });
+  });
+}
+
+async function autoRunLoop(totalRuns, options = {}) {
+  if (autoRunActive) {
+    await addLog('自动运行已在进行中', 'warn');
+    return;
+  }
+
+  clearStopRequest();
+  autoRunActive = true;
+  autoRunTotalRuns = totalRuns;
+  autoRunCurrentRun = 0;
+  autoRunAttemptRun = 0;
+  const autoRunSkipFailures = true;
+  const initialMode = options.mode === 'continue' ? 'continue' : 'restart';
+  const resumeCurrentRun = Number.isInteger(options.resumeCurrentRun) && options.resumeCurrentRun > 0
+    ? Math.min(totalRuns, options.resumeCurrentRun)
+    : 1;
+  const resumeAttemptRun = Number.isInteger(options.resumeAttemptRun) && options.resumeAttemptRun > 0
+    ? Math.min(AUTO_RUN_MAX_RETRIES_PER_ROUND + 1, options.resumeAttemptRun)
+    : 1;
+  let continueCurrentOnFirstAttempt = initialMode === 'continue';
+  let forceFreshTabsNextRun = false;
+  let stoppedEarly = false;
+  const roundSummaries = buildAutoRunRoundSummaries(totalRuns, options.resumeRoundSummaries);
+
+  if (continueCurrentOnFirstAttempt && resumeCurrentRun > 1) {
+    for (let round = 1; round < resumeCurrentRun; round += 1) {
+      const summary = roundSummaries[round - 1];
+      if (summary.status === 'pending') {
+        summary.status = 'success';
+        if (!summary.attempts) {
+          summary.attempts = 1;
+        }
+      }
+    }
+  }
+
+  let successfulRuns = roundSummaries.filter((item) => item.status === 'success').length;
+  const initialState = await getState();
+  const initialPhase = continueCurrentOnFirstAttempt && getRunningSteps(initialState.stepStatuses).length
+    ? 'waiting_step'
+    : 'running';
+
+  await setState({
+    autoRunSkipFailures,
+    autoRunRoundSummaries: serializeAutoRunRoundSummaries(totalRuns, roundSummaries),
+    ...getAutoRunStatusPayload(initialPhase, {
+      currentRun: continueCurrentOnFirstAttempt ? resumeCurrentRun : 0,
+      totalRuns,
+      attemptRun: continueCurrentOnFirstAttempt ? resumeAttemptRun : 0,
+    }),
+  });
+
+  for (let targetRun = resumeCurrentRun; targetRun <= totalRuns; targetRun += 1) {
+    const roundSummary = roundSummaries[targetRun - 1];
+    let attemptRun = continueCurrentOnFirstAttempt && targetRun === resumeCurrentRun ? resumeAttemptRun : 1;
+    let reuseExistingProgress = continueCurrentOnFirstAttempt && targetRun === resumeCurrentRun;
+
+    while (attemptRun <= AUTO_RUN_MAX_RETRIES_PER_ROUND + 1) {
+      autoRunCurrentRun = targetRun;
+      autoRunAttemptRun = attemptRun;
+      roundSummary.attempts = attemptRun;
+      let startStep = 1;
+      let useExistingProgress = false;
+
+      if (reuseExistingProgress) {
+        let currentState = await getState();
+        if (getRunningSteps(currentState.stepStatuses).length) {
+          currentState = await waitForRunningStepsToFinish({
+            currentRun: targetRun,
+            totalRuns,
+            attemptRun,
+          });
+        }
+        const resumeStep = getFirstUnfinishedStep(currentState.stepStatuses);
+        if (resumeStep && hasSavedProgress(currentState.stepStatuses)) {
+          startStep = resumeStep;
+          useExistingProgress = true;
+        } else if (hasSavedProgress(currentState.stepStatuses)) {
+          await addLog('检测到当前流程已处理完成，本轮将改为从步骤 1 重新开始。', 'info');
+        }
+      }
+
+      if (!useExistingProgress) {
+        const prevState = await getState();
+        const keepSettings = {
+          vpsUrl: prevState.vpsUrl,
+          vpsPassword: prevState.vpsPassword,
+          customPassword: prevState.customPassword,
+          autoRunSkipFailures: prevState.autoRunSkipFailures,
+          autoRunFallbackThreadIntervalMinutes: prevState.autoRunFallbackThreadIntervalMinutes,
+          autoRunDelayEnabled: prevState.autoRunDelayEnabled,
+          autoRunDelayMinutes: prevState.autoRunDelayMinutes,
+          autoStepDelaySeconds: prevState.autoStepDelaySeconds,
+          mailProvider: prevState.mailProvider,
+          emailGenerator: prevState.emailGenerator,
+          emailPrefix: prevState.emailPrefix,
+          inbucketHost: prevState.inbucketHost,
+          inbucketMailbox: prevState.inbucketMailbox,
+          cloudflareDomain: prevState.cloudflareDomain,
+          cloudflareDomains: prevState.cloudflareDomains,
+          autoRunRoundSummaries: serializeAutoRunRoundSummaries(totalRuns, roundSummaries),
+          tabRegistry: {},
+          sourceLastUrls: {},
+          ...getAutoRunStatusPayload('running', { currentRun: targetRun, totalRuns, attemptRun }),
+        };
+        await resetState();
+        await setState(keepSettings);
+        chrome.runtime.sendMessage({ type: 'AUTO_RUN_RESET' }).catch(() => { });
+        await sleepWithStop(500);
+      } else {
+        await setState({
+          autoRunSkipFailures,
+          autoRunRoundSummaries: serializeAutoRunRoundSummaries(totalRuns, roundSummaries),
+          ...getAutoRunStatusPayload('running', { currentRun: targetRun, totalRuns, attemptRun }),
+        });
+      }
+
+      if (forceFreshTabsNextRun) {
+        await addLog(`上一轮尝试已放弃，当前开始第 ${targetRun}/${totalRuns} 轮第 ${attemptRun} 次尝试。`, 'warn');
+        forceFreshTabsNextRun = false;
+      }
+
+      try {
+        throwIfStopped();
+        await broadcastAutoRunStatus('running', {
+          currentRun: targetRun,
+          totalRuns,
+          attemptRun,
+        });
+
+        await runAutoSequenceFromStep(startStep, {
+          targetRun,
+          totalRuns,
+          attemptRuns: attemptRun,
+          continued: useExistingProgress,
+        });
+
+        roundSummary.status = 'success';
+        roundSummary.finalFailureReason = '';
+        successfulRuns += 1;
+        await setState({
+          autoRunRoundSummaries: serializeAutoRunRoundSummaries(totalRuns, roundSummaries),
+        });
+        await addLog(`=== 第 ${targetRun}/${totalRuns} 轮完成（第 ${attemptRun} 次尝试成功）===`, 'ok');
+        break;
+      } catch (err) {
+        if (isStopError(err)) {
+          stoppedEarly = true;
+          await addLog(`第 ${targetRun}/${totalRuns} 轮已被用户停止`, 'warn');
+          await broadcastAutoRunStatus('stopped', {
+            currentRun: targetRun,
+            totalRuns,
+            attemptRun,
+          });
+          break;
+        }
+
+        const reason = getErrorMessage(err);
+        roundSummary.failureReasons.push(reason);
+        const canRetry = attemptRun <= AUTO_RUN_MAX_RETRIES_PER_ROUND;
+
+        await setState({
+          autoRunRoundSummaries: serializeAutoRunRoundSummaries(totalRuns, roundSummaries),
+        });
+
+        if (canRetry) {
+          const retryIndex = attemptRun;
+          if (isRestartCurrentAttemptError(err)) {
+            await addLog(`第 ${targetRun}/${totalRuns} 轮第 ${attemptRun} 次尝试需要整轮重开：${reason}`, 'warn');
+          } else {
+            await addLog(`第 ${targetRun}/${totalRuns} 轮第 ${attemptRun} 次尝试失败：${reason}`, 'error');
+          }
+          cancelPendingCommands('当前尝试已放弃。');
+          await broadcastStopToContentScripts();
+          await broadcastAutoRunStatus('retrying', {
+            currentRun: targetRun,
+            totalRuns,
+            attemptRun,
+          });
+          forceFreshTabsNextRun = true;
+          await addLog(
+            `自动重试：${Math.round(AUTO_RUN_RETRY_DELAY_MS / 1000)} 秒后开始第 ${targetRun}/${totalRuns} 轮第 ${attemptRun + 1} 次尝试（第 ${retryIndex}/${AUTO_RUN_MAX_RETRIES_PER_ROUND} 次重试）。`,
+            'warn'
+          );
+          try {
+            await sleepWithStop(AUTO_RUN_RETRY_DELAY_MS);
+          } catch (sleepError) {
+            if (isStopError(sleepError)) {
+              stoppedEarly = true;
+              await addLog(`第 ${targetRun}/${totalRuns} 轮已被用户停止`, 'warn');
+              await broadcastAutoRunStatus('stopped', {
+                currentRun: targetRun,
+                totalRuns,
+                attemptRun,
+              });
+              break;
+            }
+            throw sleepError;
+          }
+          attemptRun += 1;
+          reuseExistingProgress = false;
+          continue;
+        }
+
+        roundSummary.status = 'failed';
+        roundSummary.finalFailureReason = reason;
+        await setState({
+          autoRunRoundSummaries: serializeAutoRunRoundSummaries(totalRuns, roundSummaries),
+        });
+        await addLog(`第 ${targetRun}/${totalRuns} 轮最终失败：${reason}`, 'error');
+        await addLog(`第 ${targetRun}/${totalRuns} 轮已达到 ${AUTO_RUN_MAX_RETRIES_PER_ROUND} 次重试上限，继续下一轮。`, 'warn');
+        cancelPendingCommands('当前轮已达到重试上限。');
+        await broadcastStopToContentScripts();
+        forceFreshTabsNextRun = true;
+        break;
+      } finally {
+        reuseExistingProgress = false;
+        continueCurrentOnFirstAttempt = false;
+      }
+    }
+
+    if (stoppedEarly) {
+      break;
+    }
+  }
+
+  await setState({
+    autoRunRoundSummaries: serializeAutoRunRoundSummaries(totalRuns, roundSummaries),
+  });
+  await logAutoRunFinalSummary(totalRuns, roundSummaries);
+
+  if (stopRequested || stoppedEarly) {
+    await addLog(`=== 已停止，完成 ${successfulRuns}/${autoRunTotalRuns} 轮 ===`, 'warn');
+    await broadcastAutoRunStatus('stopped', {
+      currentRun: autoRunCurrentRun,
+      totalRuns: autoRunTotalRuns,
+      attemptRun: autoRunAttemptRun,
+    });
+  } else {
+    await addLog(`=== 全部 ${autoRunTotalRuns} 轮已执行完成，成功 ${successfulRuns} 轮 ===`, 'ok');
+    await broadcastAutoRunStatus('complete', {
+      currentRun: autoRunTotalRuns,
+      totalRuns: autoRunTotalRuns,
+      attemptRun: autoRunAttemptRun,
+    });
+  }
+  autoRunActive = false;
+  await setState({
+    autoRunRoundSummaries: serializeAutoRunRoundSummaries(totalRuns, roundSummaries),
+    ...getAutoRunStatusPayload(stopRequested || stoppedEarly ? 'stopped' : 'complete', {
+      currentRun: stopRequested || stoppedEarly ? autoRunCurrentRun : autoRunTotalRuns,
+      totalRuns: autoRunTotalRuns,
+      attemptRun: autoRunAttemptRun,
+    }),
+  });
+  clearStopRequest();
+}
+
+async function resumeAutoRun() {
+  throwIfStopped();
+  const state = await getState();
+  if (!state.email) {
+    await addLog('无法继续：当前没有邮箱地址，请先在侧边栏填写邮箱。', 'error');
+    return false;
+  }
+
+  const resumedInMemory = await resumeAutoRunIfWaitingForEmail({ silent: true });
+  if (resumedInMemory) {
+    return true;
+  }
+
+  if (!isAutoRunPausedState(state)) {
+    return false;
+  }
+
+  if (autoRunActive) {
+    return false;
+  }
+
+  const totalRuns = state.autoRunTotalRuns || 1;
+  const currentRun = state.autoRunCurrentRun || 1;
+  const attemptRun = state.autoRunAttemptRun || 1;
+
+  await addLog('检测到自动流程暂停上下文已丢失，正在从当前进度恢复自动运行...', 'warn');
+  startAutoRunLoop(totalRuns, {
+    autoRunSkipFailures: true,
+    mode: 'continue',
+    resumeCurrentRun: currentRun,
+    resumeAttemptRun: attemptRun,
+    resumeRoundSummaries: state.autoRunRoundSummaries,
   });
   return true;
 }
