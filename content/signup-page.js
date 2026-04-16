@@ -22,6 +22,7 @@ if (document.documentElement.getAttribute(SIGNUP_PAGE_LISTENER_SENTINEL) !== '1'
       || message.type === 'RESEND_VERIFICATION_CODE'
       || message.type === 'ENSURE_SIGNUP_ENTRY_READY'
       || message.type === 'ENSURE_SIGNUP_PASSWORD_PAGE_READY'
+      || message.type === 'CHATGPT_SKIP_ONBOARDING'
     ) {
       resetStopState();
       handleCommand(message).then((result) => {
@@ -83,6 +84,8 @@ async function handleCommand(message) {
       return getStep8State();
     case 'STEP8_TRIGGER_CONTINUE':
       return await step8_triggerContinue(message.payload);
+    case 'CHATGPT_SKIP_ONBOARDING':
+      return await skipChatgptOnboarding();
   }
 }
 
@@ -206,6 +209,15 @@ async function resendVerificationCode(step, timeout = 45000) {
 
   while (Date.now() - start < timeout) {
     throwIfStopped();
+
+    // Check for 405 error page and recover by clicking "Try again"
+    if (is405MethodNotAllowedPage()) {
+      await handle405ResendError(step, timeout - (Date.now() - start));
+      // After recovery, loop back to find the resend button again
+      loggedWaiting = false;
+      continue;
+    }
+
     action = findResendVerificationCodeTrigger({ allowDisabled: true });
 
     if (action && isActionEnabled(action)) {
@@ -213,6 +225,15 @@ async function resendVerificationCode(step, timeout = 45000) {
       await humanPause(350, 900);
       simulateClick(action);
       await sleep(1200);
+
+      // After clicking resend, check if 405 error appeared
+      if (is405MethodNotAllowedPage()) {
+        log(`步骤 ${step}：点击重新发送后出现 405 错误，正在恢复...`, 'warn');
+        await handle405ResendError(step, timeout - (Date.now() - start));
+        loggedWaiting = false;
+        continue;
+      }
+
       return {
         resent: true,
         buttonText: getActionText(action),
@@ -228,6 +249,43 @@ async function resendVerificationCode(step, timeout = 45000) {
   }
 
   throw new Error('无法点击重新发送验证码按钮。URL: ' + location.href);
+}
+
+function is405MethodNotAllowedPage() {
+  const pageText = document.body?.textContent || '';
+  return /405\s+Method\s+Not\s+Allowed/i.test(pageText)
+    || /Route\s+Error.*405/i.test(pageText);
+}
+
+async function handle405ResendError(step, remainingTimeout = 30000) {
+  const start = Date.now();
+  let retryCount = 0;
+
+  while (Date.now() - start < remainingTimeout) {
+    throwIfStopped();
+
+    if (!is405MethodNotAllowedPage()) {
+      // Page recovered — back to verification page
+      log(`步骤 ${step}：405 错误已恢复，页面已返回验证码页面。`);
+      return;
+    }
+
+    const retryBtn = getAuthRetryButton();
+    if (retryBtn) {
+      retryCount++;
+      log(`步骤 ${step}：检测到 405 错误页面，正在点击"Try again"（第 ${retryCount} 次）...`, 'warn');
+      await humanPause(300, 800);
+      simulateClick(retryBtn);
+
+      // Wait 3 seconds before checking again
+      await sleep(3000);
+      continue;
+    }
+
+    await sleep(500);
+  }
+
+  throw new Error(`步骤 ${step}：405 错误恢复超时，无法返回验证码页面。URL: ${location.href}`);
 }
 
 // ============================================================
@@ -720,6 +778,10 @@ function getStep5ErrorText() {
   return messages.find((text) => STEP5_SUBMIT_ERROR_PATTERN.test(text)) || '';
 }
 
+function isChatgptOnboardingPage() {
+  return /chatgpt\.com/i.test(location.href);
+}
+
 async function waitForStep5SubmitOutcome(timeout = 15000) {
   const start = Date.now();
 
@@ -733,6 +795,10 @@ async function waitForStep5SubmitOutcome(timeout = 15000) {
 
     if (isAddPhonePageReady()) {
       return { success: true, addPhonePage: true };
+    }
+
+    if (isChatgptOnboardingPage()) {
+      return { success: true, chatgptOnboarding: true };
     }
 
     if (isStep8Ready()) {
@@ -1258,28 +1324,55 @@ async function fillVerificationCode(step, payload) {
   }
 
   // Find code input — could be a single input or multiple separate inputs
+  // Retry with 405 error recovery if needed
+  const maxRetries = 3;
   let codeInput = null;
-  try {
-    codeInput = await waitForElement(VERIFICATION_CODE_INPUT_SELECTOR, 10000);
-  } catch {
-    // Check for multiple single-digit inputs (common pattern)
-    const singleInputs = document.querySelectorAll('input[maxlength="1"]');
-    if (singleInputs.length >= 6) {
-      log(`步骤 ${step}：发现分开的单字符验证码输入框，正在逐个填写...`);
-      for (let i = 0; i < 6 && i < singleInputs.length; i++) {
-        fillInput(singleInputs[i], code[i]);
-        await sleep(100);
-      }
-      const outcome = await waitForVerificationSubmitOutcome(step);
-      if (outcome.invalidCode) {
-        log(`步骤 ${step}：验证码被拒绝：${outcome.errorText}`, 'warn');
-      } else if (outcome.addPhonePage) {
-        log(`步骤 ${step}：验证码已通过，并已跳转到手机号页面。`, 'ok');
-      } else {
-        log(`步骤 ${step}：验证码已通过${outcome.assumed ? '（按成功推定）' : ''}。`, 'ok');
-      }
-      return outcome;
+
+  for (let retry = 0; retry <= maxRetries; retry++) {
+    throwIfStopped();
+
+    // Before looking for input, check if page is in 405 error state
+    if (is405MethodNotAllowedPage()) {
+      log(`步骤 ${step}：检测到 405 错误页面，正在恢复...`, 'warn');
+      await handle405ResendError(step, 30000);
+      continue;
     }
+
+    try {
+      codeInput = await waitForElement(VERIFICATION_CODE_INPUT_SELECTOR, 10000);
+      break; // Found it
+    } catch {
+      // Check for multiple single-digit inputs (common pattern)
+      const singleInputs = document.querySelectorAll('input[maxlength="1"]');
+      if (singleInputs.length >= 6) {
+        log(`步骤 ${step}：发现分开的单字符验证码输入框，正在逐个填写...`);
+        for (let i = 0; i < 6 && i < singleInputs.length; i++) {
+          fillInput(singleInputs[i], code[i]);
+          await sleep(100);
+        }
+        const outcome = await waitForVerificationSubmitOutcome(step);
+        if (outcome.invalidCode) {
+          log(`步骤 ${step}：验证码被拒绝：${outcome.errorText}`, 'warn');
+        } else if (outcome.addPhonePage) {
+          log(`步骤 ${step}：验证码已通过，并已跳转到手机号页面。`, 'ok');
+        } else {
+          log(`步骤 ${step}：验证码已通过${outcome.assumed ? '（按成功推定）' : ''}。`, 'ok');
+        }
+        return outcome;
+      }
+
+      // No input found — check if it's a 405 error and can be recovered
+      if (is405MethodNotAllowedPage() && retry < maxRetries) {
+        log(`步骤 ${step}：未找到验证码输入框且页面出现 405 错误，正在恢复...`, 'warn');
+        await handle405ResendError(step, 30000);
+        continue;
+      }
+
+      throw new Error('未找到验证码输入框。URL: ' + location.href);
+    }
+  }
+
+  if (!codeInput) {
     throw new Error('未找到验证码输入框。URL: ' + location.href);
   }
 
@@ -2009,6 +2102,41 @@ async function step5_fillNameBirthday(payload) {
   } else {
     throw new Error('未找到生日或年龄输入项。URL: ' + location.href);
   }
+  // 韩国IP判断勾选框""I agree"
+  const allConsentCheckbox = Array.from(document.querySelectorAll('input[name="allCheckboxes"][type="checkbox"]'))
+    .find((el) => {
+      const checkboxLabel = el.closest('label');
+      const labelText = normalizeInlineText(checkboxLabel?.textContent || '');
+      return (!checkboxLabel || isVisibleElement(checkboxLabel))
+        && /I\s+agree\s+to\s+all\s+of\s+the\s+following/i.test(labelText);
+    }) || null;
+
+  if (allConsentCheckbox) {
+    if (!allConsentCheckbox.checked) {
+      const checkboxLabel = allConsentCheckbox.closest('label');
+      await humanPause(500, 1500);
+      if (checkboxLabel && isVisibleElement(checkboxLabel)) {
+        simulateClick(checkboxLabel);
+      } else {
+        simulateClick(allConsentCheckbox);
+      }
+      await sleep(250);
+
+      if (!allConsentCheckbox.checked) {
+        allConsentCheckbox.click();
+        await sleep(250);
+      }
+
+      if (!allConsentCheckbox.checked) {
+        throw new Error('未能勾选 “I agree to all of the following” 复选框。');
+      }
+
+      log('步骤 5：已勾选 “I agree to all of the following”。');
+    } else {
+      log('步骤 5：“I agree to all of the following” 已勾选，跳过。');
+    }
+  }
+
 
   // Click "完成帐户创建" button
   await sleep(500);
@@ -2027,6 +2155,78 @@ async function step5_fillNameBirthday(payload) {
     throw new Error(`步骤 5：${outcome.errorText}`);
   }
 
+  if (outcome.chatgptOnboarding) {
+    log(`步骤 5：资料已通过，页面已跳转到 ChatGPT 引导页。`, 'ok');
+    reportComplete(5, { chatgptOnboarding: true });
+    return { chatgptOnboarding: true };
+  }
+
   log(`步骤 5：资料已通过。`, 'ok');
   reportComplete(5, { addPhonePage: Boolean(outcome.addPhonePage) });
+}
+
+// ============================================================
+// ChatGPT Onboarding: Skip buttons after signup redirect
+// ============================================================
+
+function findChatgptSkipButton() {
+  // Look for buttons containing "Skip" or "跳过" text with btn-ghost class
+  const buttons = document.querySelectorAll('button');
+  for (const btn of buttons) {
+    const text = (btn.textContent || '').trim();
+    if (/^(skip|跳过)$/i.test(text) && /btn-ghost/i.test(btn.className)) {
+      return btn;
+    }
+  }
+  // Fallback: look for any button matching skip text without class constraint
+  for (const btn of buttons) {
+    const text = (btn.textContent || '').trim();
+    if (/^(skip|跳过)$/i.test(text)) {
+      return btn;
+    }
+  }
+  return null;
+}
+
+async function waitForChatgptSkipButton(timeout = 15000) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    throwIfStopped();
+    const btn = findChatgptSkipButton();
+    if (btn && isVisibleElement(btn)) {
+      return btn;
+    }
+    await sleep(300);
+  }
+  return null;
+}
+
+async function skipChatgptOnboarding() {
+  log('ChatGPT 引导页：正在查找第一个"Skip/跳过"按钮...');
+
+  // Find first Skip button: sibling of "Next" button, with btn-ghost class
+  const firstSkipBtn = await waitForChatgptSkipButton(15000);
+  if (!firstSkipBtn) {
+    throw new Error('ChatGPT 引导页：未找到第一个"Skip/跳过"按钮。URL: ' + location.href);
+  }
+
+  await humanPause(500, 1200);
+  simulateClick(firstSkipBtn);
+  log('ChatGPT 引导页：已点击第一个"Skip/跳过"按钮，等待第二个按钮出现...');
+
+  // Wait 3 seconds for the second skip button to appear
+  await sleep(3000);
+
+  // Find second Skip button: sibling of "Continue" button, with btn-ghost class
+  const secondSkipBtn = await waitForChatgptSkipButton(5000);
+  if (!secondSkipBtn) {
+    log('ChatGPT 引导页：5秒内未找到第二个"Skip/跳过"按钮，判定注册已完成。', 'ok');
+    return { success: true };
+  }
+
+  await humanPause(500, 1200);
+  simulateClick(secondSkipBtn);
+  log('ChatGPT 引导页：已点击第二个"Skip/跳过"按钮，注册流程完成。', 'ok');
+
+  return { success: true };
 }
