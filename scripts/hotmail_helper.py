@@ -2,8 +2,11 @@ import email
 import html
 import imaplib
 import json
+import os
 import re
+import threading
 import time
+import traceback
 from datetime import datetime, timezone
 from email.header import decode_header
 from email.utils import parseaddr, parsedate_to_datetime
@@ -59,6 +62,10 @@ IMAP_HOST = "outlook.office365.com"
 IMAP_PORT = 993
 REQUEST_TIMEOUT_SECONDS = 45
 FETCH_LIMIT_DEFAULT = 5
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+ACCOUNT_LOG_PATH = os.path.join(BASE_DIR, "data", "account-run-history.txt")
+ACCOUNT_RECORDS_SNAPSHOT_PATH = os.path.join(BASE_DIR, "data", "account-run-history.json")
+ACCOUNT_RECORDS_LOCK = threading.Lock()
 
 
 def json_response(handler, status, payload):
@@ -111,6 +118,116 @@ def compact_text(value, limit=400):
 
 def log_info(message):
     print(f"[HotmailHelper] {message}", flush=True)
+
+
+def append_account_log(email_addr, password, status, recorded_at="", reason=""):
+    normalized_email = str(email_addr or "").strip()
+    normalized_password = str(password or "").strip()
+    normalized_status = str(status or "").strip().lower()
+    normalized_recorded_at = str(recorded_at or "").strip() or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    normalized_reason = str(reason or "").strip().replace("\r", " ").replace("\n", " ")
+
+    if not normalized_email or not normalized_password or not normalized_status:
+        raise RuntimeError("Missing email/password/status for account log append")
+
+    os.makedirs(os.path.dirname(ACCOUNT_LOG_PATH), exist_ok=True)
+    line = f"{normalized_recorded_at}\t{normalized_email}\t{normalized_password}\t{normalized_status}\t{normalized_reason}\n"
+    with ACCOUNT_RECORDS_LOCK:
+        with open(ACCOUNT_LOG_PATH, "a", encoding="utf-8") as handle:
+            handle.write(line)
+    return ACCOUNT_LOG_PATH
+
+
+def normalize_account_run_snapshot_record(record):
+    if not isinstance(record, dict):
+        return None
+
+    email_addr = str(record.get("email") or "").strip()
+    password = str(record.get("password") or "").strip()
+    final_status = str(record.get("finalStatus") or "").strip().lower()
+    if not email_addr or not password or final_status not in {"success", "failed", "stopped"}:
+        return None
+
+    finished_at = str(record.get("finishedAt") or "").strip() or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    retry_count = max(0, int(record.get("retryCount") or 0))
+    failed_step_raw = record.get("failedStep")
+    try:
+        failed_step = int(failed_step_raw)
+    except (TypeError, ValueError):
+        failed_step = None
+    if failed_step is not None and failed_step <= 0:
+        failed_step = None
+
+    auto_run_context = record.get("autoRunContext") if isinstance(record.get("autoRunContext"), dict) else None
+    normalized_auto_run_context = None
+    if auto_run_context:
+        normalized_auto_run_context = {
+            "currentRun": max(0, int(auto_run_context.get("currentRun") or 0)),
+            "totalRuns": max(0, int(auto_run_context.get("totalRuns") or 0)),
+            "attemptRun": max(0, int(auto_run_context.get("attemptRun") or 0)),
+        }
+        if not any(normalized_auto_run_context.values()):
+            normalized_auto_run_context = None
+
+    source = "auto" if str(record.get("source") or "").strip().lower() == "auto" else "manual"
+
+    return {
+        "recordId": str(record.get("recordId") or email_addr).strip() or email_addr,
+        "email": email_addr,
+        "password": password,
+        "finalStatus": final_status,
+        "finishedAt": finished_at,
+        "retryCount": retry_count,
+        "failureLabel": str(record.get("failureLabel") or "").strip(),
+        "failureDetail": str(record.get("failureDetail") or "").strip(),
+        "failedStep": failed_step,
+        "source": source,
+        "autoRunContext": normalized_auto_run_context,
+    }
+
+
+def summarize_account_run_snapshot(records):
+    summary = {
+        "total": 0,
+        "success": 0,
+        "failed": 0,
+        "retryTotal": 0,
+    }
+    for item in records:
+        summary["total"] += 1
+        if item.get("finalStatus") == "success":
+            summary["success"] += 1
+        elif item.get("finalStatus") == "failed":
+            summary["failed"] += 1
+        summary["retryTotal"] += max(0, int(item.get("retryCount") or 0))
+    return summary
+
+
+def normalize_account_run_snapshot_payload(payload):
+    if not isinstance(payload, dict):
+        raise RuntimeError("Invalid account run snapshot payload")
+
+    normalized_records = []
+    for item in payload.get("records") if isinstance(payload.get("records"), list) else []:
+        normalized = normalize_account_run_snapshot_record(item)
+        if normalized:
+            normalized_records.append(normalized)
+
+    return {
+        "generatedAt": str(payload.get("generatedAt") or "").strip() or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "summary": summarize_account_run_snapshot(normalized_records),
+        "records": normalized_records,
+    }
+
+
+def sync_account_run_records(payload):
+    normalized_payload = normalize_account_run_snapshot_payload(payload)
+    os.makedirs(os.path.dirname(ACCOUNT_RECORDS_SNAPSHOT_PATH), exist_ok=True)
+    with ACCOUNT_RECORDS_LOCK:
+        with open(ACCOUNT_RECORDS_SNAPSHOT_PATH, "w", encoding="utf-8") as handle:
+            json.dump(normalized_payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+    return ACCOUNT_RECORDS_SNAPSHOT_PATH
 
 
 def try_refresh_access_token(endpoint, client_id, refresh_token):
@@ -600,6 +717,29 @@ class HotmailHelperHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             payload = read_json_payload(self)
+
+            if self.path == "/sync-account-run-records":
+                file_path = sync_account_run_records(payload)
+                json_response(self, 200, {
+                    "ok": True,
+                    "filePath": file_path,
+                })
+                return
+
+            if self.path == "/append-account-log":
+                file_path = append_account_log(
+                    payload.get("email"),
+                    payload.get("password"),
+                    payload.get("status"),
+                    payload.get("recordedAt"),
+                    payload.get("reason"),
+                )
+                json_response(self, 200, {
+                    "ok": True,
+                    "filePath": file_path,
+                })
+                return
+
             email_addr = str(payload.get("email") or "").strip()
             client_id = str(payload.get("clientId") or "").strip()
             refresh_token = str(payload.get("refreshToken") or "").strip()
@@ -643,12 +783,15 @@ class HotmailHelperHandler(BaseHTTPRequestHandler):
 
             json_response(self, 404, {"ok": False, "error": f"Unsupported path: {self.path}"})
         except Exception as exc:
+            traceback.print_exc()
             json_response(self, 500, {"ok": False, "error": str(exc)})
 
 
 def main():
     server = ThreadingHTTPServer((HOST, PORT), HotmailHelperHandler)
     print(f"Hotmail helper listening on http://{HOST}:{PORT}", flush=True)
+    print(f"Account log file: {ACCOUNT_LOG_PATH}", flush=True)
+    print(f"Account snapshot file: {ACCOUNT_RECORDS_SNAPSHOT_PATH}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
